@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless application with Cognito authentication, API Gateway, Lambda, DynamoDB, and SNS
+
+Parameters:
+  AppName:
+    Type: String
+    Default: ServerlessApp
+    Description: Name of the application
+  
+  Stage:
+    Type: String
+    Default: dev
+    Description: Deployment stage (dev, test, prod)
+    AllowedValues:
+      - dev
+      - test
+      - prod
+
+Resources:
+  # Cognito User Pool for user authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AppName}-${Stage}-UserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AppName}-${Stage}-UserPoolClient
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false
+
+  # Cognito Identity Pool for AWS resource access
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub ${AppName}${Stage}IdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # IAM Role for authenticated users
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: !Sub ${AppName}-${Stage}-AuthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*
+
+  # Identity Pool Role Attachment
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+
+  # DynamoDB Table for storing user data
+  UserDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AppName}-${Stage}-UserData
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # SNS Topic for sending notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AppName}-${Stage}-Notifications
+      DisplayName: User Notifications
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub ${AppName}-${Stage}-LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt UserDataTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # Lambda function for processing data
+  ProcessDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-ProcessData
+      CodeUri: ./src/lambda/
+      Handler: process_data.handler
+      Runtime: nodejs14.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserDataTable
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /data
+            Method: post
+            RestApiId: !Ref ApiGateway
+            
+  # Lambda function for retrieving user data
+  GetUserDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-GetUserData
+      CodeUri: ./src/lambda/
+      Handler: get_user_data.handler
+      Runtime: nodejs14.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UserDataTable
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /data
+            Method: get
+            RestApiId: !Ref ApiGateway
+
+  # Lambda function for sending reminders
+  SendReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AppName}-${Stage}-SendReminder
+      CodeUri: ./src/lambda/
+      Handler: send_reminder.handler
+      Runtime: nodejs14.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Name: DailyReminderSchedule
+            Description: Triggers the reminder function daily
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AppName}-${Stage}-API
+      StageName: !Ref Stage
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+Outputs:
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolId
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-UserPoolClientId
+
+  IdentityPoolId:
+    Description: ID of the Cognito Identity Pool
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub ${AWS::StackName}-IdentityPoolId
+
+  ApiGatewayUrl:
+    Description: URL of the API Gateway
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiGatewayUrl
+
+  UserDataTableName:
+    Description: Name of the DynamoDB table
+    Value: !Ref UserDataTable
+    Export:
+      Name: !Sub ${AWS::StackName}-UserDataTableName
+
+  NotificationTopicArn:
+    Description: ARN of the SNS Notification Topic
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-NotificationTopicArn
